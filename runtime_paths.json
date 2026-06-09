@@ -1,5 +1,3 @@
 {
-  "base_dir": "C:\\Users\\kitit\\check\\check_PF_BP-PY-ZY\\data\\1 Нулевые файлы выгрузки макроса + файл исключений",
-  "output_dir": "C:\\Users\\kitit\\check\\check_PF_BP-PY-ZY\\data\\result",
-  "exception_file": "C:\\Users\\kitit\\check\\check_PF_BP-PY-ZY\\data\\Exception.xlsx"
+  "data_dir": "C:\\Users\\kitit\\check\\check_PF_BP-PY-ZY\\data"
 }

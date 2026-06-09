@@ -28,36 +28,91 @@ _ROOT = _project_root()
 RUNTIME_PATHS_JSON = _ROOT / "runtime_paths.json"
 BUILD_PROGRESS_JSON = _ROOT / "build_progress.json"
 
-_PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = _PROJECT_ROOT / "data"
-
-DEFAULT_BASE_DIR = DATA_DIR / "1 Нулевые файлы выгрузки макроса + файл исключений"
-DEFAULT_OUTPUT_DIR = DATA_DIR / "result"
-DEFAULT_EXCEPTION_FILE = DATA_DIR / "Exception.xlsx"
+ZERO_FILES_SUBDIR = "1 Нулевые файлы выгрузки макроса + файл исключений"
+DATA_DIR = _ROOT / "data"
 
 
-def _load_runtime_paths() -> tuple[Path, Path, Path]:
-    base = DEFAULT_BASE_DIR
-    out = DEFAULT_OUTPUT_DIR
-    exc = DEFAULT_EXCEPTION_FILE
+def _normalize_path_text(raw: object) -> str:
+    txt = str(raw or "").strip().strip('"').strip("'")
+    if not txt:
+        return ""
+    return str(Path(os.path.expandvars(os.path.expanduser(txt))))
+
+
+def _resolve_config_path(raw: object) -> Path:
+    txt = _normalize_path_text(raw)
+    if not txt:
+        return Path()
+    p = Path(txt)
+    if not p.is_absolute():
+        p = _ROOT / p
+    return p.resolve()
+
+
+def _path_for_config(p: Path) -> str:
+    p = p.resolve()
+    try:
+        return p.relative_to(_ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(p)
+
+
+def _paths_from_data_dir(data_dir: Path) -> dict[str, Path]:
+    return {
+        "data_dir": data_dir,
+        "base_dir": data_dir / ZERO_FILES_SUBDIR,
+        "output_dir": data_dir / "result",
+        "exception_file": data_dir / "Exception.xlsx",
+    }
+
+
+def load_runtime_paths_dict() -> dict[str, Path]:
+    """Все рабочие пути. Достаточно задать data_dir — остальное выводится автоматически."""
+    result = _paths_from_data_dir(DATA_DIR)
     try:
         if RUNTIME_PATHS_JSON.is_file():
             cfg = json.loads(RUNTIME_PATHS_JSON.read_text(encoding="utf-8"))
-            if cfg.get("base_dir"):
-                base = Path(cfg["base_dir"])
-            if cfg.get("output_dir"):
-                out = Path(cfg["output_dir"])
-            if cfg.get("exception_file"):
-                exc = Path(cfg["exception_file"])
+            if cfg.get("data_dir"):
+                result = _paths_from_data_dir(_resolve_config_path(cfg["data_dir"]))
+            else:
+                if cfg.get("base_dir"):
+                    result["base_dir"] = _resolve_config_path(cfg["base_dir"])
+                if cfg.get("output_dir"):
+                    result["output_dir"] = _resolve_config_path(cfg["output_dir"])
+                if cfg.get("exception_file"):
+                    result["exception_file"] = _resolve_config_path(cfg["exception_file"])
+                if result["base_dir"].name == ZERO_FILES_SUBDIR:
+                    result["data_dir"] = result["base_dir"].parent
+                elif cfg.get("base_dir"):
+                    result["data_dir"] = result["base_dir"].parent
     except Exception:
         pass
+
+    if os.environ.get("REPORTS_DATA_DIR"):
+        result = _paths_from_data_dir(_resolve_config_path(os.environ["REPORTS_DATA_DIR"]))
     if os.environ.get("REPORTS_BASE_DIR"):
-        base = Path(os.environ["REPORTS_BASE_DIR"])
+        result["base_dir"] = _resolve_config_path(os.environ["REPORTS_BASE_DIR"])
     if os.environ.get("REPORTS_OUTPUT_DIR"):
-        out = Path(os.environ["REPORTS_OUTPUT_DIR"])
+        result["output_dir"] = _resolve_config_path(os.environ["REPORTS_OUTPUT_DIR"])
     if os.environ.get("REPORTS_EXCEPTION_FILE"):
-        exc = Path(os.environ["REPORTS_EXCEPTION_FILE"])
-    return base, out, exc
+        result["exception_file"] = _resolve_config_path(os.environ["REPORTS_EXCEPTION_FILE"])
+    if result["base_dir"].name == ZERO_FILES_SUBDIR:
+        result["data_dir"] = result["base_dir"].parent
+    return result
+
+
+def save_runtime_paths(data_dir: str) -> dict[str, str]:
+    paths = _paths_from_data_dir(_resolve_config_path(data_dir))
+    payload = {"data_dir": _path_for_config(paths["data_dir"])}
+    tmp = RUNTIME_PATHS_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(RUNTIME_PATHS_JSON)
+    return {k: str(v) for k, v in paths.items()}
+
+
+def _load_runtime_paths() -> tuple[Path, Path, Path]:
+    d = load_runtime_paths_dict()
+    return d["base_dir"], d["output_dir"], d["exception_file"]
 
 
 BASE_DIR, OUTPUT_DIR, WEB_EXCEPTION_FILE = _load_runtime_paths()

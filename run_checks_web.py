@@ -18,12 +18,15 @@ BUILD_SCRIPT = ROOT / "build_checks.py"
 STATUS_FILE = ROOT / "status.json"
 BUILD_LOG = ROOT / "last_build_checks.log"
 BUILD_PROGRESS_FILE = ROOT / "build_progress.json"
-RUNTIME_PATHS_JSON = ROOT / "runtime_paths.json"
 DATA_DIR = ROOT / "data"
-DEFAULT_WEB_EXCEPTION_XLSX = DATA_DIR / "Exception.xlsx"
 STARTUP_LOG = ROOT / "run_checks_web_startup.log"
-DEFAULT_BASE_DIR = Path(r"C:\Users\kitit\check\check_PF_BP-PY-ZY\data\1 Нулевые файлы выгрузки макроса + файл исключений")
-DEFAULT_OUTPUT_DIR = Path(r"C:\Users\kitit\check\check_PF_BP-PY-ZY\data\result")
+
+from build_checks import (
+    ZERO_FILES_SUBDIR,
+    load_runtime_paths_dict,
+    save_runtime_paths,
+    _normalize_path_text,
+)
 
 _run_lock = threading.Lock()
 
@@ -33,45 +36,6 @@ def _append_startup_log(message: str) -> None:
     with open(STARTUP_LOG, "a", encoding="utf-8", errors="replace") as f:
         f.write(f"[{ts}] {message}\n")
 
-
-def _normalize_path_text(raw: str) -> str:
-    txt = str(raw or "").strip().strip('"').strip("'")
-    if not txt:
-        return ""
-    txt = os.path.expandvars(os.path.expanduser(txt))
-    return str(Path(txt))
-
-
-def _load_runtime_paths() -> dict[str, Path]:
-    base_dir = DEFAULT_BASE_DIR
-    output_dir = DEFAULT_OUTPUT_DIR
-    exception_file = DEFAULT_WEB_EXCEPTION_XLSX
-    try:
-        if RUNTIME_PATHS_JSON.is_file():
-            cfg = json.loads(RUNTIME_PATHS_JSON.read_text(encoding="utf-8"))
-            base_raw = str(cfg.get("base_dir", "")).strip()
-            out_raw = str(cfg.get("output_dir", "")).strip()
-            exc_raw = str(cfg.get("exception_file", "")).strip()
-            if base_raw:
-                base_dir = Path(base_raw)
-            if out_raw:
-                output_dir = Path(out_raw)
-            if exc_raw:
-                exception_file = Path(exc_raw)
-    except (OSError, ValueError, TypeError):
-        pass
-    return {"base_dir": base_dir, "output_dir": output_dir, "exception_file": exception_file}
-
-
-def _save_runtime_paths(base_dir: str, output_dir: str, exception_file: str) -> dict[str, str]:
-    b = Path(_normalize_path_text(base_dir))
-    o = Path(_normalize_path_text(output_dir))
-    e = Path(_normalize_path_text(exception_file))
-    payload = {"base_dir": str(b), "output_dir": str(o), "exception_file": str(e)}
-    tmp = RUNTIME_PATHS_JSON.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(RUNTIME_PATHS_JSON)
-    return payload
 
 def _probe_port_available(host: str, port: int) -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -117,7 +81,7 @@ def create_app():
     app = Flask(__name__)
 
     def exception_file_path() -> Path:
-        return _load_runtime_paths()["exception_file"]
+        return load_runtime_paths_dict()["exception_file"]
 
     def _norm(v: object) -> str:
         s = str(v if v is not None else "").strip()
@@ -143,10 +107,13 @@ def create_app():
         def esc_path(p: Path) -> str:
             return str(p.resolve()).replace("&", "&amp;").replace("<", "&lt;")
 
-        paths = _load_runtime_paths()
-        exc_path_disp = esc_path(paths["exception_file"])
-        base_dir_disp = esc_path(paths["base_dir"])
-        output_dir_disp = esc_path(paths["output_dir"])
+        paths = load_runtime_paths_dict()
+        data_dir_disp = esc_path(paths["data_dir"])
+        path_hint = (
+            f"Выгрузки: {esc_path(paths['base_dir'])}<br>"
+            f"Результаты: {esc_path(paths['output_dir'])}<br>"
+            f"Exception: {esc_path(paths['exception_file'])}"
+        )
         html = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -188,15 +155,13 @@ def create_app():
     <h1>Проверка PF BP-PY-ZY</h1>
 
     <div class="exceptions-panel">
-        <h3>Пути сервиса</h3>
-        <label for="baseDirPath">Путь к нулевым выгрузкам</label>
-        <div class="path-row"><input type="text" id="baseDirPath" value="__BASE_DIR__" placeholder="Путь к нулевым выгрузкам"></div>
-        <label for="outputDirPath">Путь к результатам</label>
-        <div class="path-row"><input type="text" id="outputDirPath" value="__OUTPUT_DIR__" placeholder="Путь к результатам"></div>
-        <label for="exceptionFilePath">Файл исключений (Exception.xlsx)</label>
-        <div class="path-row"><input type="text" id="exceptionFilePath" value="__EXC_PATH__" placeholder="Путь к Exception.xlsx"></div>
-        <button type="button" id="savePathsBtn">Сохранить пути</button>
-        <p style="margin:0.5rem 0 0 0; font-size:0.9rem;">После сохранения новые пути применяются к следующему запуску формирования.</p>
+        <h3>Папка data</h3>
+        <p style="margin:0 0 0.5rem 0; font-size:0.9rem;">Одна папка — внутри автоматически: <code>__ZERO_SUBDIR__\\3801…</code>, <code>result\\</code>, <code>Exception.xlsx</code>. Можно указать <code>data</code> (рядом со скриптами) или полный путь.</p>
+        <label for="dataDirPath">Путь к папке data</label>
+        <div class="path-row"><input type="text" id="dataDirPath" value="__DATA_DIR__" placeholder="data или C:\\путь\\к\\data"></div>
+        <p id="pathHint" class="path-hint" style="margin:0.5rem 0 0 0; font-size:0.85rem; color:#555;">__PATH_HINT__</p>
+        <button type="button" id="savePathsBtn">Сохранить путь</button>
+        <p style="margin:0.5rem 0 0 0; font-size:0.9rem;">Сохраняется в <code>runtime_paths.json</code> — одна строка <code>data_dir</code>.</p>
     </div>
 
     <form id="runForm">
@@ -317,23 +282,25 @@ def create_app():
             renderDeleteExceptions();
         };
         document.getElementById('savePathsBtn').onclick = async function() {
-            const base_dir = document.getElementById('baseDirPath').value.trim();
-            const output_dir = document.getElementById('outputDirPath').value.trim();
-            const exception_file = document.getElementById('exceptionFilePath').value.trim();
-            if (!base_dir || !output_dir || !exception_file) {
-                alert('Заполните все пути');
+            const data_dir = document.getElementById('dataDirPath').value.trim();
+            if (!data_dir) {
+                alert('Укажите папку data');
                 return;
             }
             const resp = await fetch('/paths', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({base_dir, output_dir, exception_file})
+                body: JSON.stringify({data_dir})
             });
             const result = await resp.json();
             if (result.success) {
-                alert('Пути сохранены');
+                const hint = document.getElementById('pathHint');
+                if (hint && result.base_dir) {
+                    hint.innerHTML = 'Выгрузки: ' + result.base_dir + '<br>Результаты: ' + result.output_dir + '<br>Exception: ' + result.exception_file;
+                }
+                alert('Путь сохранён');
             } else {
-                alert('Ошибка сохранения путей: ' + (result.error || 'unknown'));
+                alert('Ошибка сохранения пути: ' + (result.error || 'unknown'));
             }
         };
         
@@ -422,9 +389,9 @@ def create_app():
 </body>
 </html>"""
         return (
-            html.replace("__EXC_PATH__", exc_path_disp)
-            .replace("__BASE_DIR__", base_dir_disp)
-            .replace("__OUTPUT_DIR__", output_dir_disp)
+            html.replace("__DATA_DIR__", data_dir_disp)
+            .replace("__PATH_HINT__", path_hint)
+            .replace("__ZERO_SUBDIR__", ZERO_FILES_SUBDIR)
         )
 
     @app.route("/run", methods=["POST"])
@@ -438,7 +405,7 @@ def create_app():
                 cmd = [_resolve_python_executable(), str(BUILD_SCRIPT), "--mode", mode, "--skip-manual-exceptions"]
                 if folders:
                     cmd.extend(["--folders", folders])
-                paths_cfg = _load_runtime_paths()
+                paths_cfg = load_runtime_paths_dict()
 
                 ok = False
                 detail = ""
@@ -446,9 +413,7 @@ def create_app():
                 child_env = {
                     **os.environ,
                     "PYTHONUNBUFFERED": "1",
-                    "REPORTS_BASE_DIR": str(paths_cfg["base_dir"]),
-                    "REPORTS_OUTPUT_DIR": str(paths_cfg["output_dir"]),
-                    "REPORTS_EXCEPTION_FILE": str(paths_cfg["exception_file"]),
+                    "REPORTS_DATA_DIR": str(paths_cfg["data_dir"]),
                 }
                 try:
                     if not paths_cfg["base_dir"].exists():
@@ -686,21 +651,17 @@ def create_app():
     def save_paths():
         try:
             data = request.get_json() or {}
-            base_dir = _normalize_path_text(str(data.get("base_dir", "")))
-            output_dir = _normalize_path_text(str(data.get("output_dir", "")))
-            exception_file = _normalize_path_text(str(data.get("exception_file", "")))
-            if not base_dir or not output_dir or not exception_file:
-                return jsonify({"success": False, "error": "Все пути обязательны"}), 400
-            base_p = Path(base_dir)
-            out_p = Path(output_dir)
-            exc_p = Path(exception_file)
-            if not base_p.exists():
-                return jsonify({"success": False, "error": f"Каталог нулевых выгрузок не найден: {base_p}"}), 400
-            if not base_p.is_dir():
-                return jsonify({"success": False, "error": f"Путь нулевых выгрузок не является каталогом: {base_p}"}), 400
-            out_p.mkdir(parents=True, exist_ok=True)
-            exc_p.parent.mkdir(parents=True, exist_ok=True)
-            payload = _save_runtime_paths(base_dir, output_dir, exception_file)
+            data_dir = _normalize_path_text(str(data.get("data_dir", "")))
+            if not data_dir:
+                return jsonify({"success": False, "error": "Укажите папку data"}), 400
+            data_p = Path(data_dir)
+            if not data_p.is_absolute():
+                data_p = (ROOT / data_p).resolve()
+            if not data_p.exists():
+                return jsonify({"success": False, "error": f"Папка data не найдена: {data_p}"}), 400
+            if not data_p.is_dir():
+                return jsonify({"success": False, "error": f"Путь не является каталогом: {data_p}"}), 400
+            payload = save_runtime_paths(data_dir)
             return jsonify({"success": True, **payload})
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500

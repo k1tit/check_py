@@ -73,20 +73,14 @@ _BILL_TO_B_SIDE = [
 
 
 def dedupe_base_access(df: pd.DataFrame) -> pd.DataFrame:
-    """q_*_Base_DelDup: GROUP BY Customer, First() для полей (кроме Name — кириллица)."""
+    """q_*_Base_DelDup: GROUP BY Customer, First() = первая строка группы (кроме Name — кириллица)."""
     if df.empty:
         return df
 
-    def _first(series: pd.Series) -> object:
-        non_empty = series.dropna()
-        non_empty = non_empty[non_empty.astype(str).str.strip().ne("")]
-        if len(non_empty):
-            return non_empty.iloc[0]
-        return series.iloc[0] if len(series) else ""
-
     rows = []
     for _, grp in df.groupby("Customer", sort=False, dropna=False):
-        row = {col: _first(grp[col]) for col in df.columns if col != "Name"}
+        # Access First([field]) — значение из первой физической строки группы, не «первое непустое».
+        row = grp.iloc[0].to_dict()
         if "Name" in grp.columns:
             names = [s.strip() for s in grp["Name"].fillna("").astype(str) if s.strip()]
             cyr = [n for n in names if _CYR.search(n)]
