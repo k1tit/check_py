@@ -489,17 +489,67 @@ def merge_all_partners(base: pd.DataFrame, bp_df, py_df, zy_df) -> pd.DataFrame:
     return result
 
 
+def _load_folder_exports(folder: str) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    """Base + BP/PY/ZY для одной SOrg (для параллельной загрузки)."""
+    fp = BASE_DIR / folder
+    f_base = _get_file(fp, "*Base*.xlsx")
+    f_bp = _get_file(fp, "*BP*.xlsx")
+    f_py = _get_file(fp, "*PY*.xlsx")
+    f_zy = _get_file(fp, "*ZY*.xlsx")
+
+    def _read_base_part() -> pd.DataFrame | None:
+        return _read_base(f_base, folder) if f_base else None
+
+    def _read_part(path: Path | None) -> pd.DataFrame | None:
+        return _read_partner(path, folder) if path else None
+
+    parallel = os.environ.get("REPORTS_PARALLEL", "1").strip().lower() not in ("0", "false", "no")
+    if parallel and any([f_base, f_bp, f_py, f_zy]):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix=f"ld{folder}") as pool:
+            fut_base = pool.submit(_read_base_part) if f_base else None
+            fut_bp = pool.submit(_read_part, f_bp) if f_bp else None
+            fut_py = pool.submit(_read_part, f_py) if f_py else None
+            fut_zy = pool.submit(_read_part, f_zy) if f_zy else None
+            base = fut_base.result() if fut_base else None
+            bp = fut_bp.result() if fut_bp else None
+            py = fut_py.result() if fut_py else None
+            zy = fut_zy.result() if fut_zy else None
+        return base, bp, py, zy
+
+    return _read_base_part(), _read_part(f_bp), _read_part(f_py), _read_part(f_zy)
+
+
 def load_data(folders: list[str]) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
     bases, bps, pys, zys = [], [], [], []
-    for folder in folders:
-        fp = BASE_DIR / folder
-        f = _get_file(fp, "*Base*.xlsx")
-        if f:
-            bases.append(_read_base(f, folder))
-        for lst, pat in [(bps, "*BP*.xlsx"), (pys, "*PY*.xlsx"), (zys, "*ZY*.xlsx")]:
-            f = _get_file(fp, pat)
-            if f:
-                lst.append(_read_partner(f, folder))
+    parallel = os.environ.get("REPORTS_PARALLEL", "1").strip().lower() not in ("0", "false", "no")
+    if parallel and len(folders) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = min(len(folders), 4)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="load_data") as pool:
+            parts = list(pool.map(_load_folder_exports, folders))
+        for base, bp, py, zy in parts:
+            if base is not None:
+                bases.append(base)
+            if bp is not None:
+                bps.append(bp)
+            if py is not None:
+                pys.append(py)
+            if zy is not None:
+                zys.append(zy)
+    else:
+        for folder in folders:
+            base, bp, py, zy = _load_folder_exports(folder)
+            if base is not None:
+                bases.append(base)
+            if bp is not None:
+                bps.append(bp)
+            if py is not None:
+                pys.append(py)
+            if zy is not None:
+                zys.append(zy)
     if not bases:
         return pd.DataFrame(), None, None, None
     base = dedupe_base(pd.concat(bases, ignore_index=True))
@@ -1275,7 +1325,14 @@ def main() -> int:
     parser.add_argument("--mode", choices=["pairs", "single", "custom_single", "custom_group"], default="pairs")
     parser.add_argument("--folders", default="")
     parser.add_argument("--skip-manual-exceptions", action="store_true")  # ignored, kept for web UI compat
+    parser.add_argument("--workers", type=int, default=0, help="Параллельных потоков (0 = авто)")
+    parser.add_argument("--no-parallel", action="store_true", help="Отключить параллельное чтение Excel")
     args = parser.parse_args()
+
+    if args.no_parallel:
+        os.environ["REPORTS_PARALLEL"] = "0"
+    elif args.workers > 0:
+        os.environ["REPORTS_WORKERS"] = str(args.workers)
 
     if not BASE_DIR.exists():
         print(f"[build_checks] Нет каталога: {BASE_DIR}", flush=True)

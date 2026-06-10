@@ -6,9 +6,11 @@ PF BP-PY-ZY — логика 1:1 с Access (q_*_Joined_1_Checks, q_*_Joined_3_Bi
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +21,8 @@ try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None  # type: ignore
+
+from parallel_io import async_io, gather_limited, parallel_enabled, shutdown_executor, worker_count
 
 from build_checks import (
     BASE_DIR,
@@ -247,18 +251,39 @@ def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFr
     if not f_base:
         return pd.DataFrame(), None, None, None
 
-    print(f"[new_access] SO {folder}: Base → {f_base.name}", flush=True)
-    base = dedupe_base_access(_read_base(f_base, folder))
+    f_bp = _get_file(fp, "*BP*.xlsx")
+    f_py = _get_file(fp, "*PY*.xlsx")
+    f_zy = _get_file(fp, "*ZY*.xlsx")
 
-    def _partner(pat: str, label: str) -> pd.DataFrame | None:
-        f = _get_file(fp, pat)
-        if not f:
-            print(f"[new_access] SO {folder}: {label} не найден ({pat})", flush=True)
+    def _load_base() -> pd.DataFrame:
+        print(f"[new_access] SO {folder}: Base → {f_base.name}", flush=True)
+        return dedupe_base_access(_read_base(f_base, folder))
+
+    def _load_partner(path: Path | None, label: str) -> pd.DataFrame | None:
+        if not path:
+            print(f"[new_access] SO {folder}: {label} не найден", flush=True)
             return None
-        print(f"[new_access] SO {folder}: {label} → {f.name}", flush=True)
-        return _read_partner(f, folder, kind=label)
+        print(f"[new_access] SO {folder}: {label} → {path.name}", flush=True)
+        return _read_partner(path, folder, kind=label)
 
-    return base, _partner("*BP*.xlsx", "BP"), _partner("*PY*.xlsx", "PY"), _partner("*ZY*.xlsx", "ZY")
+    if parallel_enabled():
+        jobs: dict[str, object] = {"base": _load_base}
+        if f_bp:
+            jobs["BP"] = lambda: _load_partner(f_bp, "BP")
+        if f_py:
+            jobs["PY"] = lambda: _load_partner(f_py, "PY")
+        if f_zy:
+            jobs["ZY"] = lambda: _load_partner(f_zy, "ZY")
+        with ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix=f"so{folder}") as pool:
+            futs = {k: pool.submit(fn) for k, fn in jobs.items()}
+            base = futs["base"].result()
+            bp = futs["BP"].result() if "BP" in futs else None
+            py = futs["PY"].result() if "PY" in futs else None
+            zy = futs["ZY"].result() if "ZY" in futs else None
+        return base, bp, py, zy
+
+    base = _load_base()
+    return base, _load_partner(f_bp, "BP"), _load_partner(f_py, "PY"), _load_partner(f_zy, "ZY")
 
 
 def add_checks_access(df: pd.DataFrame) -> pd.DataFrame:
@@ -498,24 +523,16 @@ def process_sorg(folder: str, exc_keys: set[tuple[str, str]]) -> tuple[pd.DataFr
     return errors, bill_to, base_raw
 
 
-def process_pair(pair_name: str, folders: list[str], exc_df: pd.DataFrame) -> bool:
-    exc_keys = exception_keys(exc_df)
+def _merge_sorg_results(
+    pair_name: str,
+    folders: list[str],
+    results: list[tuple[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]],
+    exc_df: pd.DataFrame,
+) -> bool:
     errors_parts: list[pd.DataFrame] = []
     bill_parts: list[pd.DataFrame] = []
-
-    steps = len(folders) + 1
-    iterator = folders
-    if tqdm is not None:
-        iterator = tqdm(folders, desc=pair_name, unit="SOrg", leave=True)
-
-    for folder in iterator:
-        msg = f"SO {folder}: чтение и проверки…"
-        if tqdm is not None and hasattr(iterator, "set_postfix_str"):
-            iterator.set_postfix_str(msg)
-        else:
-            print(f"[new_access] {pair_name}: {msg}", flush=True)
-
-        errors, bill_to, base = process_sorg(folder, exc_keys)
+    order = {f: i for i, f in enumerate(folders)}
+    for folder, (errors, bill_to, base) in sorted(results, key=lambda x: order.get(x[0], 0)):
         if not base.empty:
             print(
                 f"[new_access] SO {folder}: ошибок {len(errors)}, Bill-to {len(bill_to)}",
@@ -534,10 +551,65 @@ def process_pair(pair_name: str, folders: list[str], exc_df: pd.DataFrame) -> bo
     return True
 
 
+def process_pair(pair_name: str, folders: list[str], exc_df: pd.DataFrame) -> bool:
+    """Последовательная обработка (для отладки и --no-parallel)."""
+    exc_keys = exception_keys(exc_df)
+    results: list[tuple[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]] = []
+    iterator = folders
+    if tqdm is not None:
+        iterator = tqdm(folders, desc=pair_name, unit="SOrg", leave=True)
+    for folder in iterator:
+        msg = f"SO {folder}: чтение и проверки…"
+        if tqdm is not None and hasattr(iterator, "set_postfix_str"):
+            iterator.set_postfix_str(msg)
+        else:
+            print(f"[new_access] {pair_name}: {msg}", flush=True)
+        results.append((folder, process_sorg(folder, exc_keys)))
+    return _merge_sorg_results(pair_name, folders, results, exc_df)
+
+
+async def process_pair_async(pair_name: str, folders: list[str], exc_df: pd.DataFrame) -> bool:
+    exc_keys = exception_keys(exc_df)
+    workers = worker_count(len(folders), default_cap=2)
+
+    if not parallel_enabled() or workers <= 1 or len(folders) <= 1:
+        return process_pair(pair_name, folders, exc_df)
+
+    print(
+        f"[new_access] {pair_name}: параллельно {len(folders)} SOrg (workers={workers})",
+        flush=True,
+    )
+
+    async def _one(folder: str):
+        print(f"[new_access] {pair_name}: SO {folder}: чтение и проверки…", flush=True)
+        res = await async_io(process_sorg, folder, exc_keys)
+        return folder, res
+
+    results = await gather_limited([_one(f) for f in folders], limit=workers)
+    return _merge_sorg_results(pair_name, folders, list(results), exc_df)
+
+
+async def _run_all_pairs(jobs: list[tuple[str, list[str]]], exc_df: pd.DataFrame) -> None:
+    for pair_name, folders in jobs:
+        await process_pair_async(pair_name, folders, exc_df)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="PF BP-PY-ZY — логика Access, отчёт парами")
     parser.add_argument("--mode", choices=["pairs"], default="pairs")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Параллельных SOrg в паре (0 = авто, 1 = последовательно)",
+    )
+    parser.add_argument("--no-parallel", action="store_true", help="Отключить параллельное чтение и обработку")
     args = parser.parse_args()
+
+    if args.no_parallel:
+        os.environ["REPORTS_PARALLEL"] = "0"
+    elif args.workers > 0:
+        os.environ["REPORTS_WORKERS"] = str(args.workers)
 
     paths = load_runtime_paths_dict()
     print(f"[new_access] data_dir:  {paths['data_dir']}", flush=True)
@@ -552,14 +624,17 @@ def main() -> int:
     exc_df = collect_and_persist_global_exception(BASE_DIR, OUTPUT_DIR)
 
     jobs = [(name, cfg["folders"]) for name, cfg in PAIRS.items()]
-    print(f"[new_access] пары: {', '.join(j[0] for j in jobs)}", flush=True)
+    par = "вкл" if parallel_enabled() else "выкл"
+    w = worker_count(2, default_cap=2)
+    print(f"[new_access] пары: {', '.join(j[0] for j in jobs)} | parallel={par} workers≈{w}", flush=True)
 
     try:
-        for pair_name, folders in jobs:
-            process_pair(pair_name, folders, exc_df)
+        asyncio.run(_run_all_pairs(jobs, exc_df))
     except Exception:
         traceback.print_exc()
         return 1
+    finally:
+        shutdown_executor()
 
     print("[new_access] готово", flush=True)
     return 0
