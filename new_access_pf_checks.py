@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -255,16 +256,28 @@ def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFr
     f_py = _get_file(fp, "*PY*.xlsx")
     f_zy = _get_file(fp, "*ZY*.xlsx")
 
+    def _file_mb(path: Path | None) -> str:
+        if not path or not path.is_file():
+            return "?"
+        return f"{path.stat().st_size / (1024 * 1024):.1f} MB"
+
     def _load_base() -> pd.DataFrame:
-        print(f"[new_access] SO {folder}: Base → {f_base.name}", flush=True)
-        return dedupe_base_access(_read_base(f_base, folder))
+        print(f"[new_access] SO {folder}: читаю Base {f_base.name} ({_file_mb(f_base)})…", flush=True)
+        t0 = time.perf_counter()
+        df = dedupe_base_access(_read_base(f_base, folder))
+        print(f"[new_access] SO {folder}: Base готов, {len(df)} строк, {time.perf_counter() - t0:.0f} с", flush=True)
+        return df
 
     def _load_partner(path: Path | None, label: str) -> pd.DataFrame | None:
         if not path:
             print(f"[new_access] SO {folder}: {label} не найден", flush=True)
             return None
-        print(f"[new_access] SO {folder}: {label} → {path.name}", flush=True)
-        return _read_partner(path, folder, kind=label)
+        print(f"[new_access] SO {folder}: читаю {label} {path.name} ({_file_mb(path)})…", flush=True)
+        t0 = time.perf_counter()
+        df = _read_partner(path, folder, kind=label)
+        rows = len(df) if df is not None and not df.empty else 0
+        print(f"[new_access] SO {folder}: {label} готов, {rows} строк, {time.perf_counter() - t0:.0f} с", flush=True)
+        return df
 
     if parallel_enabled():
         jobs: dict[str, object] = {"base": _load_base}
