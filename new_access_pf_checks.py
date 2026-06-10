@@ -110,6 +110,18 @@ def _effective_so(df: pd.DataFrame, folder_so: str) -> pd.Series:
     return so
 
 
+def _rows_for_sorg_sheet(df: pd.DataFrame, so_key: str) -> pd.DataFrame:
+    """Строки для листа пары: _folder (номер папки SO) важнее колонки SO из выгрузки."""
+    if df is None or df.empty or not so_key:
+        return pd.DataFrame()
+    key = _norm(so_key)
+    if "_folder" in df.columns:
+        by_folder = _ns(df["_folder"]).eq(key)
+        if by_folder.any():
+            return df[by_folder].copy()
+    return df[_effective_so(df, key).eq(key)].copy()
+
+
 def apply_exception_access(base_dd: pd.DataFrame, exc_keys: set[tuple[str, str]], folder_so: str) -> pd.DataFrame:
     """Access: LEFT JOIN Exception … WHERE e.Customer IS NULL (до checks, на base)."""
     if base_dd.empty or not exc_keys:
@@ -379,12 +391,9 @@ def build_bill_to_access(df_checks: pd.DataFrame, base_dd: pd.DataFrame) -> pd.D
 
     pool1 = pool1.copy()
     if "_folder" in pool1.columns:
-        so_series = _ns(pool1["SO"]) if "SO" in pool1.columns else pd.Series("", index=pool1.index, dtype=object)
-        need = so_series.eq("") | so_series.isna()
-        if need.any():
-            if "SO" not in pool1.columns:
-                pool1["SO"] = ""
-            pool1.loc[need, "SO"] = _ns(pool1.loc[need, "_folder"])
+        pool1["SO"] = _ns(pool1["_folder"])
+    elif "SO" not in pool1.columns:
+        pool1["SO"] = ""
 
     orblk_col = _col(base_dd, "OrBlk", "OrBlk 1")
     if not orblk_col:
@@ -449,10 +458,8 @@ def build_bill_to_access(df_checks: pd.DataFrame, base_dd: pd.DataFrame) -> pd.D
 
 
 def _bill_to_rows_access(bt: pd.DataFrame, so_key: str) -> pd.DataFrame:
-    """Лист SOrg: только j.[SO] = SOrg (Access не фильтрует BP SO в WHERE)."""
-    if bt.empty or not so_key:
-        return pd.DataFrame()
-    return bt[_effective_so(bt, so_key).eq(so_key)].copy()
+    """Лист SOrg: j.[SO] = SOrg (для пары — по _folder / SO из папки выгрузки)."""
+    return _rows_for_sorg_sheet(bt, so_key)
 
 
 def _bill_to_sheet_label(so_token: str) -> str:
@@ -480,7 +487,7 @@ def save_pair_excel(
                 continue
             title = _unique_excel_sheet_name(_mismatch_sheet_label(so_key), used)
             used.add(title)
-            sub = errors_df[_effective_so(errors_df, so_key).eq(so_key)] if not errors_df.empty else errors_df
+            sub = _rows_for_sorg_sheet(errors_df, so_key)
             if not sub.empty:
                 sub = sub.sort_values(
                     by=[c for c in ("Comment MD Analyst", "Customer") if c in sub.columns],
@@ -491,8 +498,10 @@ def save_pair_excel(
                 pd.DataFrame({"Сообщение": [f"Нет несоответствий для SO {so_key}"]}).to_excel(
                     w, sheet_name=title, index=False
                 )
+                print(f"[new_access] лист «{title}»: 0 несоответствий", flush=True)
             else:
                 prep.to_excel(w, sheet_name=title, index=False)
+                print(f"[new_access] лист «{title}»: {len(prep)} несоответствий", flush=True)
 
         for folder_so in sorg_folders:
             so_key = _norm(folder_so)
@@ -504,8 +513,10 @@ def save_pair_excel(
             grp = _prep_bill_to_sheet(grp_raw) if not grp_raw.empty else pd.DataFrame(columns=BILL_TO_COLS)
             if grp.empty:
                 pd.DataFrame(columns=BILL_TO_COLS).to_excel(w, sheet_name=title, index=False)
+                print(f"[new_access] лист «{title}»: 0 Bill-to", flush=True)
             else:
                 grp.to_excel(w, sheet_name=title, index=False)
+                print(f"[new_access] лист «{title}»: {len(grp)} Bill-to", flush=True)
 
         if not exc_df.empty:
             exc_df.to_excel(w, sheet_name="Exception", index=False)

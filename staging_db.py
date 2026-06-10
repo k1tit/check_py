@@ -133,7 +133,9 @@ class StagingDB:
             if df is None or df.empty:
                 self._conn.execute(f'DROP TABLE IF EXISTS "{name}"')
                 return
-            prepared = df.fillna("").astype(str)
+            prepared = df.fillna("").astype(str).replace(
+                {"nan": "", "None": "", "<NA>": "", "none": ""}
+            )
             self._conn.register("_staging_df", prepared)
             try:
                 self._conn.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM _staging_df')
@@ -152,7 +154,7 @@ class StagingDB:
             df = self._conn.execute(f'SELECT * FROM "{name}"').df()
         if df.empty:
             return None
-        return df.fillna("")
+        return df.fillna("").replace({"nan": "", "None": "", "<NA>": "", "none": ""})
 
     def populate(
         self,
