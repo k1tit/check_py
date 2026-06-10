@@ -24,13 +24,7 @@ except ImportError:
     tqdm = None  # type: ignore
 
 from parallel_io import async_io, gather_limited, parallel_enabled, shutdown_executor, worker_count
-from sorg_db import (
-    DEFAULT_ASK_SORG,
-    ask_use_db,
-    db_exists,
-    load_db,
-    save_db,
-)
+from staging_db import staging_active, start_staging, stop_staging
 
 from build_checks import (
     BASE_DIR,
@@ -63,11 +57,6 @@ from build_checks import (
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
-
-# Локальная SQLite для SOrg: --use-db / --no-db / по умолчанию спрос для 3804
-_DB_OFF = False
-_DB_FORCE_USE: set[str] = set()
-_DB_ASK: set[str] = set(DEFAULT_ASK_SORG)
 
 # Как в Access q_*_Joined_1 (без «самлинг» — его нет в SQL)
 ACCESS_NAME_BLACKLIST = (
@@ -314,27 +303,17 @@ def _load_sorg_from_excel(
 
 
 def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
-    """Excel или локальная SQLite data/db/{SO}.sqlite (вопрос в консоли для 3804)."""
-    if not _DB_OFF:
-        use_db = folder in _DB_FORCE_USE
-        if not use_db and folder in _DB_ASK and db_exists(folder):
-            use_db = ask_use_db(folder)
-        if use_db:
-            loaded = load_db(folder)
-            if loaded is not None:
-                return loaded
-            print(f"[new_access] SO {folder}: БД недоступна — читаю xlsx…", flush=True)
-    try:
-        return _load_sorg_from_excel(folder)
-    except Exception:
-        if db_exists(folder) and not _DB_OFF:
-            print(
-                f"[new_access] SO {folder}: xlsx не прочитался. "
-                f"Есть локальная БД — перезапустите и ответьте Y, "
-                f"или: python import_sorg_db.py {folder}",
-                flush=True,
-            )
-        raise
+    """DuckDB staging (если включена) или чтение xlsx."""
+    if staging_active():
+        from staging_db import get_staging
+
+        base, bp, py, zy = get_staging().load_raw(folder)
+        if base.empty:
+            return pd.DataFrame(), None, None, None
+        base = dedupe_base_access(base)
+        print(f"[new_access] SO {folder}: из DuckDB — base {len(base)} строк", flush=True)
+        return base, bp, py, zy
+    return _load_sorg_from_excel(folder)
 
 
 def add_checks_access(df: pd.DataFrame) -> pd.DataFrame:
@@ -701,52 +680,16 @@ def main() -> int:
     )
     parser.add_argument("--no-parallel", action="store_true", help="Отключить параллельное чтение и обработку")
     parser.add_argument(
-        "--build-db",
-        metavar="SO",
-        help="Залить SOrg в локальную SQLite (data/db/SO.sqlite) и выйти",
-    )
-    parser.add_argument(
-        "--use-db",
-        metavar="SO",
-        action="append",
-        default=[],
-        help="Всегда брать SOrg из БД (без вопроса), напр. --use-db 3804",
-    )
-    parser.add_argument("--no-db", action="store_true", help="Не использовать БД, только xlsx")
-    parser.add_argument(
-        "--db-ask",
-        metavar="SO",
-        action="append",
-        default=[],
-        help="Спрашивать в консоли (по умолчанию только 3804)",
+        "--no-staging",
+        action="store_true",
+        help="Не использовать DuckDB: читать xlsx напрямую (как раньше)",
     )
     args = parser.parse_args()
-
-    global _DB_OFF, _DB_FORCE_USE, _DB_ASK
-    if args.no_db:
-        _DB_OFF = True
-    if args.use_db:
-        _DB_FORCE_USE.update(s.strip() for s in args.use_db if s.strip())
-    if args.db_ask:
-        _DB_ASK = set(s.strip() for s in args.db_ask if s.strip())
 
     if args.no_parallel:
         os.environ["REPORTS_PARALLEL"] = "0"
     elif args.workers > 0:
         os.environ["REPORTS_WORKERS"] = str(args.workers)
-
-    if args.build_db:
-        os.environ["REPORTS_PARALLEL"] = "0"
-        from import_sorg_db import load_sorg_for_db
-
-        so = args.build_db.strip()
-        print(f"[new_access] заливка SO {so} в SQLite…", flush=True)
-        base, bp, py, zy = load_sorg_for_db(so, via_excel=(so == "3804"))
-        if base.empty:
-            print(f"[new_access] нет Base для SO {so}", flush=True)
-            return 1
-        save_db(so, base, bp, py, zy)
-        return 0
 
     paths = load_runtime_paths_dict()
     script_root = Path(__file__).resolve().parent
@@ -770,12 +713,21 @@ def main() -> int:
     exc_df = collect_and_persist_global_exception(BASE_DIR, OUTPUT_DIR)
 
     jobs = [(name, cfg["folders"]) for name, cfg in PAIRS.items()]
+    all_sorgs = sorted({so for _, folders in jobs for so in folders})
     par = "вкл" if parallel_enabled() else "выкл"
     w = worker_count(2, default_cap=2)
-    print(f"[new_access] пары: {', '.join(j[0] for j in jobs)} | parallel={par} workers≈{w}", flush=True)
+    staging_mode = "DuckDB" if not args.no_staging else "xlsx"
+    print(
+        f"[new_access] пары: {', '.join(j[0] for j in jobs)} | "
+        f"источник={staging_mode} | parallel={par} workers≈{w}",
+        flush=True,
+    )
 
     exit_code = 0
     try:
+        if not args.no_staging:
+            os.environ["REPORTS_PARALLEL"] = "0"
+            start_staging(all_sorgs)
         pair_errors = asyncio.run(_run_all_pairs(jobs, exc_df))
         if pair_errors:
             exit_code = 1
@@ -786,6 +738,7 @@ def main() -> int:
         traceback.print_exc()
         exit_code = 1
     finally:
+        stop_staging()
         shutdown_executor()
     return exit_code
 

@@ -635,7 +635,15 @@ def merge_all_partners(base: pd.DataFrame, bp_df, py_df, zy_df) -> pd.DataFrame:
 
 
 def _load_folder_exports(folder: str) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
-    """Base + BP/PY/ZY для одной SOrg (для параллельной загрузки)."""
+    """Base + BP/PY/ZY для одной SOrg (DuckDB staging или xlsx)."""
+    from staging_db import staging_active, get_staging
+
+    if staging_active():
+        base, bp, py, zy = get_staging().load_raw(folder)
+        if base.empty:
+            return None, None, None, None
+        return base, bp, py, zy
+
     fp = BASE_DIR / folder
     f_base = _get_file(fp, "*Base*.xlsx")
     f_bp = _get_file(fp, "*BP*.xlsx")
@@ -1472,6 +1480,11 @@ def main() -> int:
     parser.add_argument("--skip-manual-exceptions", action="store_true")  # ignored, kept for web UI compat
     parser.add_argument("--workers", type=int, default=0, help="Параллельных потоков (0 = авто)")
     parser.add_argument("--no-parallel", action="store_true", help="Отключить параллельное чтение Excel")
+    parser.add_argument(
+        "--no-staging",
+        action="store_true",
+        help="Не использовать DuckDB: читать xlsx напрямую",
+    )
     args = parser.parse_args()
 
     if args.no_parallel:
@@ -1498,8 +1511,16 @@ def main() -> int:
 
     nj = len(jobs)
     report_build_progress(5, f"Задач: {nj}", job_index=0, job_total=nj)
+    all_sorgs = sorted({so for _, folders in jobs for so in folders})
     produced = False
+    exit_code = 0
     try:
+        if not args.no_staging:
+            from staging_db import start_staging
+
+            os.environ["REPORTS_PARALLEL"] = "0"
+            report_build_progress(6, "Загрузка xlsx в DuckDB…", job_index=0, job_total=nj)
+            start_staging(all_sorgs)
         for i, (job_name, job_folders) in enumerate(jobs):
             lo = 6 + int(88 * i / nj)
             hi = 6 + int(88 * (i + 1) / nj)
@@ -1511,7 +1532,14 @@ def main() -> int:
                 produced = True
     except Exception:
         traceback.print_exc()
-        return 1
+        exit_code = 1
+    finally:
+        from staging_db import stop_staging
+
+        stop_staging()
+
+    if exit_code:
+        return exit_code
 
     if not produced:
         report_build_progress(95, "Ни один отчёт не сохранён", job_index=nj, job_total=max(1, nj))
