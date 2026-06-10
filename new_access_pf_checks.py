@@ -24,6 +24,13 @@ except ImportError:
     tqdm = None  # type: ignore
 
 from parallel_io import async_io, gather_limited, parallel_enabled, shutdown_executor, worker_count
+from sorg_db import (
+    DEFAULT_ASK_SORG,
+    ask_use_db,
+    db_exists,
+    load_db,
+    save_db,
+)
 
 from build_checks import (
     BASE_DIR,
@@ -56,6 +63,11 @@ from build_checks import (
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
+
+# Локальная SQLite для SOrg: --use-db / --no-db / по умолчанию спрос для 3804
+_DB_OFF = False
+_DB_FORCE_USE: set[str] = set()
+_DB_ASK: set[str] = set(DEFAULT_ASK_SORG)
 
 # Как в Access q_*_Joined_1 (без «самлинг» — его нет в SQL)
 ACCESS_NAME_BLACKLIST = (
@@ -246,7 +258,9 @@ def apply_filters_access(df: pd.DataFrame) -> pd.DataFrame:
     return df[mask_name & mask_cgrp & mask_orblk & mask_inn].copy()
 
 
-def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+def _load_sorg_from_excel(
+    folder: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
     fp = BASE_DIR / folder
     f_base = _get_file(fp, "*Base*.xlsx")
     if not f_base:
@@ -297,6 +311,30 @@ def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFr
 
     base = _load_base()
     return base, _load_partner(f_bp, "BP"), _load_partner(f_py, "PY"), _load_partner(f_zy, "ZY")
+
+
+def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    """Excel или локальная SQLite data/db/{SO}.sqlite (вопрос в консоли для 3804)."""
+    if not _DB_OFF:
+        use_db = folder in _DB_FORCE_USE
+        if not use_db and folder in _DB_ASK and db_exists(folder):
+            use_db = ask_use_db(folder)
+        if use_db:
+            loaded = load_db(folder)
+            if loaded is not None:
+                return loaded
+            print(f"[new_access] SO {folder}: БД недоступна — читаю xlsx…", flush=True)
+    try:
+        return _load_sorg_from_excel(folder)
+    except Exception:
+        if db_exists(folder) and not _DB_OFF:
+            print(
+                f"[new_access] SO {folder}: xlsx не прочитался. "
+                f"Есть локальная БД — перезапустите и ответьте Y, "
+                f"или: python import_sorg_db.py {folder}",
+                flush=True,
+            )
+        raise
 
 
 def add_checks_access(df: pd.DataFrame) -> pd.DataFrame:
@@ -662,12 +700,53 @@ def main() -> int:
         help="Параллельных SOrg в паре (0 = авто, 1 = последовательно)",
     )
     parser.add_argument("--no-parallel", action="store_true", help="Отключить параллельное чтение и обработку")
+    parser.add_argument(
+        "--build-db",
+        metavar="SO",
+        help="Залить SOrg в локальную SQLite (data/db/SO.sqlite) и выйти",
+    )
+    parser.add_argument(
+        "--use-db",
+        metavar="SO",
+        action="append",
+        default=[],
+        help="Всегда брать SOrg из БД (без вопроса), напр. --use-db 3804",
+    )
+    parser.add_argument("--no-db", action="store_true", help="Не использовать БД, только xlsx")
+    parser.add_argument(
+        "--db-ask",
+        metavar="SO",
+        action="append",
+        default=[],
+        help="Спрашивать в консоли (по умолчанию только 3804)",
+    )
     args = parser.parse_args()
+
+    global _DB_OFF, _DB_FORCE_USE, _DB_ASK
+    if args.no_db:
+        _DB_OFF = True
+    if args.use_db:
+        _DB_FORCE_USE.update(s.strip() for s in args.use_db if s.strip())
+    if args.db_ask:
+        _DB_ASK = set(s.strip() for s in args.db_ask if s.strip())
 
     if args.no_parallel:
         os.environ["REPORTS_PARALLEL"] = "0"
     elif args.workers > 0:
         os.environ["REPORTS_WORKERS"] = str(args.workers)
+
+    if args.build_db:
+        os.environ["REPORTS_PARALLEL"] = "0"
+        from import_sorg_db import load_sorg_for_db
+
+        so = args.build_db.strip()
+        print(f"[new_access] заливка SO {so} в SQLite…", flush=True)
+        base, bp, py, zy = load_sorg_for_db(so, via_excel=(so == "3804"))
+        if base.empty:
+            print(f"[new_access] нет Base для SO {so}", flush=True)
+            return 1
+        save_db(so, base, bp, py, zy)
+        return 0
 
     paths = load_runtime_paths_dict()
     script_root = Path(__file__).resolve().parent

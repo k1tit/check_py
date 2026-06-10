@@ -382,12 +382,82 @@ def _read_excel_robust(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Не удалось прочитать {path.name} ({fmt}):\n{detail}")
 
 
-def _read_excel_checked(path: Path, *, kind: str, folder: str) -> pd.DataFrame:
+def read_excel_via_com(path: Path) -> pd.DataFrame:
+    """
+    Чтение через установленный Excel (Windows).
+    Нужно, когда pandas/openpyxl пишут BadZipFile, а Excel файл открывает.
+    """
+    try:
+        import win32com.client  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Чтение через Excel: pip install pywin32 (Windows + установленный Microsoft Excel)"
+        ) from exc
+
+    resolved = str(path.resolve())
+    excel = win32com.client.DispatchEx("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    excel.ScreenUpdating = False
+    try:
+        wb = excel.Workbooks.Open(resolved, ReadOnly=True, UpdateLinks=0, CorruptLoad=1)
+        try:
+            ws = wb.Worksheets(1)
+            used = ws.UsedRange
+            nrows = int(used.Rows.Count)
+            ncols = int(used.Columns.Count)
+            if nrows < 1 or ncols < 1:
+                return pd.DataFrame()
+            raw = used.Value
+        finally:
+            wb.Close(False)
+    finally:
+        excel.Quit()
+
+    if nrows == 1 and ncols == 1:
+        rows: list[list[object]] = [[raw]]
+    elif nrows == 1:
+        rows = [list(raw)]
+    elif ncols == 1:
+        rows = [[v] for v in raw]
+    else:
+        rows = [list(r) for r in raw]
+
+    header = ["" if c is None else str(c).strip() for c in rows[0]]
+    data = rows[1:]
+    df = pd.DataFrame(data, columns=header)
+    return df.astype(str).replace({"None": "", "nan": "", "<NA>": ""})
+
+
+def _read_excel_with_com_fallback(path: Path, *, folder: str, kind: str) -> pd.DataFrame:
+    try:
+        return _read_excel_robust(path)
+    except Exception as first_exc:
+        if sys.platform != "win32":
+            raise first_exc
+        print(
+            f"[build_checks] SO {folder} {kind}: pandas не прочитал ({type(first_exc).__name__}), "
+            f"пробую через Excel…",
+            flush=True,
+        )
+        return read_excel_via_com(path)
+
+
+def _read_excel_checked(
+    path: Path,
+    *,
+    kind: str,
+    folder: str,
+    allow_com: bool = False,
+) -> pd.DataFrame:
     """read_excel с понятной ошибкой: какой файл и SO не читается."""
     snap_before = _file_snapshot(path)
     fmt = _peek_file_format(path)
     try:
-        df = _read_excel_robust(path)
+        if allow_com:
+            df = _read_excel_with_com_fallback(path, folder=folder, kind=kind)
+        else:
+            df = _read_excel_robust(path)
     except Exception as exc:
         if fmt == "xls_ole":
             hint = (
@@ -427,8 +497,7 @@ def _read_excel_checked(path: Path, *, kind: str, folder: str) -> pd.DataFrame:
 _CYR = re.compile(r"[А-Яа-яЁё]")
 
 
-def _read_base(path: Path, folder: str) -> pd.DataFrame:
-    df = _read_excel_checked(path, kind="Base", folder=folder)
+def _normalize_base_df(df: pd.DataFrame, folder: str) -> pd.DataFrame:
     df = df.rename(columns={"OrBlk.1": "OrBlk1"})
     so = _so_col(df)
     if so and so != "SO":
@@ -446,6 +515,11 @@ def _read_base(path: Path, folder: str) -> pd.DataFrame:
         df = df.rename(columns={g4: "Grp4"})
     df["_folder"] = folder
     return df
+
+
+def _read_base(path: Path, folder: str, *, allow_com: bool = False) -> pd.DataFrame:
+    df = _read_excel_checked(path, kind="Base", folder=folder, allow_com=allow_com)
+    return _normalize_base_df(df, folder)
 
 
 def dedupe_base(df: pd.DataFrame) -> pd.DataFrame:
@@ -480,8 +554,7 @@ def dedupe_base(df: pd.DataFrame) -> pd.DataFrame:
     return result[df.columns].reset_index(drop=True)
 
 
-def _read_partner(path: Path, folder: str, *, kind: str = "partner") -> pd.DataFrame:
-    df = _read_excel_checked(path, kind=kind, folder=folder)
+def _normalize_partner_df(df: pd.DataFrame, folder: str, *, kind: str = "partner") -> pd.DataFrame:
     kunnr = _col(df, "KUNNR", "Customer", "Sold-to")
     ktonr = _col(df, "KTONR", "BP", "PY", "ZY")
     if not kunnr or not ktonr:
@@ -491,6 +564,17 @@ def _read_partner(path: Path, folder: str, *, kind: str = "partner") -> pd.DataF
     out["KTONR"] = _nc(out["KTONR"])
     out["_folder"] = folder
     return out.dropna(subset=["KUNNR"]).drop_duplicates(subset=["KUNNR", "_folder"], keep="first")
+
+
+def _read_partner(
+    path: Path,
+    folder: str,
+    *,
+    kind: str = "partner",
+    allow_com: bool = False,
+) -> pd.DataFrame:
+    df = _read_excel_checked(path, kind=kind, folder=folder, allow_com=allow_com)
+    return _normalize_partner_df(df, folder, kind=kind)
 
 
 def merge_partner(base_lookup: pd.DataFrame, partner_df: pd.DataFrame | None, prefix: str) -> pd.DataFrame:
