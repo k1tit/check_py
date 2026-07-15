@@ -557,12 +557,47 @@ def process_sorg(folder: str, exc_keys: set[tuple[str, str]]) -> tuple[pd.DataFr
     errors = checked[checked["Comment MD Analyst"].fillna("").astype(str).str.strip() != ""].copy()
     bill_to = build_bill_to_access(checked, base_raw)
 
+    # Диагностика лавины «Ship-to … без OB M»: после OrBlk-swap у BP OrBlk1 должно быть много M.
+    bp_ob = (
+        filtered["BP OrBlk1"].fillna("").astype(str).str.upper().str.strip()
+        if "BP OrBlk1" in filtered.columns
+        else pd.Series(dtype=object)
+    )
+    m_orblk = (
+        (base_raw["OrBlk"].fillna("").astype(str).str.upper().str.strip() == "M").sum()
+        if "OrBlk" in base_raw.columns
+        else -1
+    )
+    ship_bp = 0
+    if not errors.empty and "Comment MD Analyst" in errors.columns:
+        ship_bp = int(
+            errors["Comment MD Analyst"].astype(str).str.contains("Ship-to прикреплён к BP без OB M", na=False).sum()
+        )
+    print(
+        f"[new_access] SO {folder}: OrBlk(M)={m_orblk} | BP OrBlk1(M)={(bp_ob == 'M').sum()} "
+        f"| errors={len(errors)} (Ship-to без OB M={ship_bp}) | Bill-to={len(bill_to)}",
+        flush=True,
+    )
+    if ship_bp > 1000:
+        print(
+            f"[new_access] SO {folder}: ВНИМАНИЕ — {ship_bp} «Ship-to без OB M». "
+            f"Похоже OrBlk не swap’нут (для 3802 нужны колонки OrBlk+OrBlk.1→swap). "
+            f"Проверьте git log -1 и что нет старого staging.duckdb.",
+            flush=True,
+        )
+
     if os.environ.get("REPORTS_DEBUG"):
         dup = checked.groupby("Customer").size().sort_values(ascending=False)
         print(
             f"[new_access] DEBUG SO {folder}: base_raw={len(base_raw)} base_exc={len(base)} "
             f"merged={len(merged)} filtered={len(filtered)} errors={len(errors)} "
             f"dup_max={dup.max() if len(dup) else 0}",
+            flush=True,
+        )
+        print(
+            f"[new_access] DEBUG SO {folder}: Cust OrBlk Bill-to={checked['Cust OrBlk Bill-to'].value_counts().to_dict()} "
+            f"BP OrBlk Bill-to={checked['BP OrBlk Bill-to'].value_counts().to_dict()} "
+            f"Check Cust&BP={checked['Check Cust&BP'].value_counts().to_dict()}",
             flush=True,
         )
 
