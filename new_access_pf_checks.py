@@ -553,13 +553,8 @@ def process_sorg(folder: str, exc_keys: set[tuple[str, str]]) -> tuple[pd.DataFr
         return pd.DataFrame(), pd.DataFrame(), base_raw
 
     checked = add_checks_access(filtered)
-    # В итоговую сборку не включаем BP, помеченные на удаление:
-    # при LEFT JOIN им соответствует пустой BP Name.
+    # Access ErrorsOnly: Comment не пустой; без Distinct и без фильтра по BP Name
     errors = checked[checked["Comment MD Analyst"].fillna("").astype(str).str.strip() != ""].copy()
-    if not errors.empty:
-        errors = errors[
-            errors["BP Name"].fillna("").astype(str).str.strip().ne("")
-        ].copy()
     bill_to = build_bill_to_access(checked, base_raw)
 
     # Диагностика лавины «Ship-to … без OB M»: после OrBlk-swap у BP OrBlk1 должно быть много M.
